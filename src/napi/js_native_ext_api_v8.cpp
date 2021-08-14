@@ -247,6 +247,8 @@ napi_status napi_ext_create_env(napi_ext_env_settings *settings, napi_env *env)
   args.flags.enableJitTracing         = settings->flags.enable_jit_tracing;
   args.flags.enableMessageTracing     = settings->flags.enable_message_tracing;
   args.flags.enableGCTracing          = settings->flags.enable_gc_tracing;
+  args.flags.enableInspector          = settings->flags.enable_inspector;
+  args.flags.waitForDebugger          = settings->flags.wait_for_debugger;
   args.flags.enableGCApi              = settings->flags.enable_gc_api;
   args.flags.ignoreUnhandledPromises  = settings->flags.ignore_unhandled_promises;
 
