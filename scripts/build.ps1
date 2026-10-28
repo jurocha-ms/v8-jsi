@@ -8,6 +8,7 @@ param(
     [string]$AppPlatform = "win32",
     [switch]$UseClang,
     [switch]$UseLibCpp,
+    [switch]$EnableLifetimeTests,
     [switch]$FakeBuild
 )
 
@@ -25,6 +26,9 @@ Push-Location (Join-Path $workpath "v8")
 
 # Generate the build system
 $gnargs = 'v8_enable_i18n_support=false is_component_build=false v8_monolithic=true v8_use_external_startup_data=false treat_warnings_as_errors=false'
+if ($EnableLifetimeTests) {
+    $gnargs += ' v8jsi_enable_lifetime_tests=true'
+}
 
 if (!$buildingWindows) {
     $gnargs += " use_goma=false target_os=""$AppPlatform"""
@@ -202,6 +206,9 @@ Copy-Item "$jsigitpath\public\Readme.md" -Destination "$OutputPath\build\native\
 Copy-Item "$jsigitpath\public\ScriptStore.h" -Destination "$OutputPath\build\native\include\"
 Copy-Item "$jsigitpath\public\v8_api.h" -Destination "$OutputPath\build\native\include\"
 Copy-Item "$jsigitpath\public\V8JsiRuntime.h" -Destination "$OutputPath\build\native\include\"
+if ($EnableLifetimeTests) {
+    Copy-Item "$jsigitpath\public\V8JsiRuntimeTest.h" -Destination "$OutputPath\build\native\include\"
+}
 
 Copy-Item "$jsigitpath\jsi\jsi.h" -Destination "$OutputPath\build\native\jsi\jsi\"
 Copy-Item "$jsigitpath\jsi\jsi-inl.h" -Destination "$OutputPath\build\native\jsi\jsi\"

@@ -27,6 +27,22 @@ namespace v8runtime {
 
 thread_local uint16_t V8Runtime::tls_isolate_usage_counter_ = 0;
 
+#if defined(V8JSI_ENABLE_LIFETIME_TESTS)
+extern "C" void __cdecl v8jsi_get_host_proxy_lifetime_stats(HostProxyLifetimeStats *stats) noexcept {
+  *stats = {
+      hostProxyLifetimeCounters.proxiesAllocated.load(),
+      hostProxyLifetimeCounters.proxiesFreed.load(),
+      hostProxyLifetimeCounters.trackersAllocated.load(),
+      hostProxyLifetimeCounters.trackersFreed.load()};
+}
+
+extern "C" facebook::jsi::Runtime *__cdecl v8jsi_create_runtime_for_lifetime_test() {
+  V8RuntimeArgs args;
+  args.flags.enableGCApi = true;
+  return makeV8Runtime(std::move(args)).release();
+}
+#endif
+
 struct ContextEmbedderIndex {
   constexpr static int Runtime = 0;
   constexpr static int ContextTag = 1;
@@ -65,12 +81,16 @@ const char *ToCString(const v8::String::Utf8Value &value) {
 /*static*/ void *const V8Runtime::RuntimeContextTagPtr =
     const_cast<void *>(static_cast<const void *>(&V8Runtime::RuntimeContextTag));
 
-void V8Runtime::AddHostObjectLifetimeTracker(std::shared_ptr<HostObjectLifetimeTracker> hostObjectLifetimeTracker) {
-  // Note that we are letting the list grow in definitely as of now.. The list
-  // gets cleaned up when the runtime is teared down.
-  // TODO :: We should remove entries from the list as the objects are garbage
-  // collected.
-  host_object_lifetime_tracker_list_.push_back(hostObjectLifetimeTracker);
+void V8Runtime::AddHostObjectLifetimeTracker(std::unique_ptr<HostObjectLifetimeTracker> hostObjectLifetimeTracker) {
+  auto position = host_object_lifetime_tracker_list_.insert(
+      host_object_lifetime_tracker_list_.end(), std::move(hostObjectLifetimeTracker));
+  (*position)->Track(position);
+}
+
+void V8Runtime::RemoveHostObjectLifetimeTracker(HostObjectLifetimeTrackers::iterator position) {
+  auto tracker = std::move(*position);
+  // Unlink before releasing captures: their destructors can trigger another GC.
+  host_object_lifetime_tracker_list_.erase(position);
 }
 
 /*static */ void V8Runtime::OnMessage(v8::Local<v8::Message> message, v8::Local<v8::Value> error) {
@@ -441,16 +461,35 @@ V8Runtime::~V8Runtime() {
   }
 #endif
 
-  host_object_constructor_.Reset();
-  context_.Reset();
+  {
+    IsolateLocker isolate_locker(this);
+    HostObjectLifetimeTrackers retiredTrackers;
+    for (auto &tracker : host_object_lifetime_tracker_list_) {
+      tracker->ResetHandle();
+    }
 
-  for (std::shared_ptr<HostObjectLifetimeTracker> hostObjectLifetimeTracker : host_object_lifetime_tracker_list_) {
-    hostObjectLifetimeTracker->ResetHostObject(false /*isGC*/);
+    while (!host_object_lifetime_tracker_list_.empty()) {
+      if (pending_host_object_callbacks_ != 0) {
+        // Reset cannot cancel a second pass already queued by V8. A full,
+        // synchronous collection drains it while its callback data is alive.
+        isolate_->LowMemoryNotification();
+        assert(pending_host_object_callbacks_ == 0);
+      }
+      if (!host_object_lifetime_tracker_list_.empty()) {
+        auto position = host_object_lifetime_tracker_list_.begin();
+        (*position)->ResetHandle();
+        retiredTrackers.splice(retiredTrackers.end(), host_object_lifetime_tracker_list_, position);
+        // Keep the proxy shells alive until every capture has been released:
+        // a capture's destructor can reenter another host function.
+        retiredTrackers.back()->ReleaseResources();
+      }
+    }
+
+    GetAndClearLastUnhandledPromiseRejection();
   }
 
-  host_object_lifetime_tracker_list_.clear();
-
-  GetAndClearLastUnhandledPromiseRejection();
+  host_object_constructor_.Reset();
+  context_.Reset();
 
 #if defined(_WIN32) && defined(V8JSI_ENABLE_INSPECTOR)
   if (inspector_agent_) {
@@ -1081,16 +1120,17 @@ jsi::Object V8Runtime::createObject() {
 
 jsi::Object V8Runtime::createObject(std::shared_ptr<jsi::HostObject> hostobject) {
   IsolateLocker isolate_locker(this);
-  HostObjectProxy *hostObjectProxy = new HostObjectProxy(*this, hostobject);
+  auto hostObjectProxy = std::make_unique<HostObjectProxy>(*this, hostobject);
   v8::Local<v8::Object> newObject;
   if (!host_object_constructor_.Get(GetIsolate())->NewInstance(GetContextLocal()).ToLocal(&newObject)) {
     throw jsi::JSError(*this, "HostObject construction failed!!");
   }
 
   newObject->SetInternalField(
-      0, v8::Local<v8::External>::New(GetIsolate(), v8::External::New(GetIsolate(), hostObjectProxy)));
+      0, v8::Local<v8::External>::New(GetIsolate(), v8::External::New(GetIsolate(), hostObjectProxy.get())));
 
-  AddHostObjectLifetimeTracker(std::make_shared<HostObjectLifetimeTracker>(*this, newObject, hostObjectProxy));
+  AddHostObjectLifetimeTracker(
+      std::make_unique<HostObjectLifetimeTracker>(*this, newObject, std::move(hostObjectProxy)));
 
   return make<jsi::Object>(V8ObjectValue::make(GetIsolate(), newObject));
 }
@@ -1192,8 +1232,7 @@ bool V8Runtime::isHostObject(const jsi::Object &obj) const {
 
   HostObjectProxy *hostObjectProxy = reinterpret_cast<HostObjectProxy *>(internalField->Value());
 
-  for (const std::shared_ptr<HostObjectLifetimeTracker> &hostObjectLifetimeTracker :
-       host_object_lifetime_tracker_list_) {
+  for (const auto &hostObjectLifetimeTracker : host_object_lifetime_tracker_list_) {
     if (hostObjectLifetimeTracker->IsEqual(hostObjectProxy)) {
       return true;
     }
@@ -1263,13 +1302,13 @@ jsi::Function V8Runtime::createFunctionFromHostFunction(
     jsi::HostFunctionType func) {
   IsolateLocker isolate_locker(this);
 
-  HostFunctionProxy *hostFunctionProxy = new HostFunctionProxy(*this, func);
+  auto hostFunctionProxy = std::make_unique<HostFunctionProxy>(*this, std::move(func));
 
   v8::Local<v8::Function> newFunction;
   if (!v8::Function::New(
            GetContextLocal(),
            HostFunctionProxy::HostFunctionCallback,
-           v8::Local<v8::External>::New(GetIsolate(), v8::External::New(GetIsolate(), hostFunctionProxy)),
+           v8::Local<v8::External>::New(GetIsolate(), v8::External::New(GetIsolate(), hostFunctionProxy.get())),
            paramCount)
            .ToLocal(&newFunction)) {
     throw jsi::JSError(*this, "Creation of HostFunction failed.");
@@ -1277,7 +1316,8 @@ jsi::Function V8Runtime::createFunctionFromHostFunction(
 
   newFunction->SetName(v8::Local<v8::String>::Cast(valueRef(name)));
 
-  AddHostObjectLifetimeTracker(std::make_shared<HostObjectLifetimeTracker>(*this, newFunction, hostFunctionProxy));
+  AddHostObjectLifetimeTracker(
+      std::make_unique<HostObjectLifetimeTracker>(*this, newFunction, std::move(hostFunctionProxy)));
 
   return make<jsi::Object>(V8ObjectValue::make(GetIsolate(), newFunction)).getFunction(*this);
 }

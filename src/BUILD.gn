@@ -4,6 +4,9 @@ declare_args() {
 
   # Sets -DV8JSI_ENABLE_NODE_API
   v8jsi_enable_node_api = true
+
+  # Native allocation counters and exports for cross-DLL lifetime tests.
+  v8jsi_enable_lifetime_tests = false
 }
 
 # Hybrid CRT: drop the static UCRT pulled in by /MT(d) and use the dynamic
@@ -140,6 +143,9 @@ target("shared_library", "v8jsi") {
   ]
 
   defines = [ "BUILDING_V8JSI_SHARED" ]
+  if (v8jsi_enable_lifetime_tests) {
+    defines += [ "V8JSI_ENABLE_LIFETIME_TESTS" ]
+  }
 
   if (is_win) {
     libs = [
@@ -178,6 +184,9 @@ target("executable", "jsitests") {
   ]
 
   cflags = [ "-DJSI_V8_IMPL" ]
+  if (v8jsi_enable_lifetime_tests) {
+    defines = [ "V8JSI_ENABLE_LIFETIME_TESTS" ]
+  }
 
   # Run microtasks explicitly for JSI
   cflags += [ "-DJSI_SUPPORT_MICROTASKS" ]

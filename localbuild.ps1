@@ -16,6 +16,8 @@ param(
 
     [switch]$NoSetup,
 
+    [switch]$EnableLifetimeTests,
+
     [switch]$FakeBuild
 )
 
@@ -44,7 +46,8 @@ foreach ($Plat in $Platform) {
         foreach ($AppPlat in $AppPlatform) {
             Write-Host "Building $AppPlat $Plat $Config..."
             & ".\scripts\build.ps1" -SourcesPath $SourcesPath -OutputPath $OutputPath `
-              -Platform $Plat -Configuration $Config -AppPlatform $AppPlat -FakeBuild:$FakeBuild
+              -Platform $Plat -Configuration $Config -AppPlatform $AppPlat -FakeBuild:$FakeBuild `
+              -EnableLifetimeTests:$EnableLifetimeTests
         }
     }
 }

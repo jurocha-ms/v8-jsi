@@ -29,8 +29,22 @@
 #include <cstdlib>
 
 #include "V8Instrumentation.h"
+#if defined(V8JSI_ENABLE_LIFETIME_TESTS)
+#include "public/V8JsiRuntimeTest.h"
+#endif
 
 namespace v8runtime {
+
+#if defined(V8JSI_ENABLE_LIFETIME_TESTS)
+struct HostProxyLifetimeCounters {
+  std::atomic<uint64_t> proxiesAllocated{0};
+  std::atomic<uint64_t> proxiesFreed{0};
+  std::atomic<uint64_t> trackersAllocated{0};
+  std::atomic<uint64_t> trackersFreed{0};
+};
+
+inline HostProxyLifetimeCounters hostProxyLifetimeCounters;
+#endif
 
 class NativeStateHolder;
 
@@ -195,43 +209,91 @@ class V8Runtime : public facebook::jsi::Runtime {
 
  private:
   struct IHostProxy {
+    virtual ~IHostProxy() = default;
     virtual void destroy() = 0;
+
+#if defined(V8JSI_ENABLE_LIFETIME_TESTS)
+    static void *operator new(size_t size) {
+      auto memory = ::operator new(size);
+      ++hostProxyLifetimeCounters.proxiesAllocated;
+      return memory;
+    }
+
+    static void operator delete(void *memory) noexcept {
+      ::operator delete(memory);
+      ++hostProxyLifetimeCounters.proxiesFreed;
+    }
+#endif
   };
+
+  class HostObjectLifetimeTracker;
+  using HostObjectLifetimeTrackers = std::list<std::unique_ptr<HostObjectLifetimeTracker>>;
 
   class HostObjectLifetimeTracker {
    public:
-    void ResetHostObject(bool isGC /*whether the call is coming from GC*/) {
-      assert(!isGC || !isReset_);
-      if (!isReset_) {
-        isReset_ = true;
-        hostProxy_->destroy();
-        objectTracker_.Reset();
-      }
+    void ResetHandle() noexcept {
+      objectTracker_.Reset();
     }
 
-    HostObjectLifetimeTracker(V8Runtime &runtime, v8::Local<v8::Object> obj, IHostProxy *hostProxy)
-        : hostProxy_(hostProxy) {
+    void ReleaseResources() {
+      hostProxy_->destroy();
+    }
+
+    HostObjectLifetimeTracker(
+        V8Runtime &runtime, v8::Local<v8::Object> obj, std::unique_ptr<IHostProxy> hostProxy)
+        : runtime_(runtime), hostProxy_(std::move(hostProxy)) {
       objectTracker_.Reset(runtime.GetIsolate(), obj);
+    }
+
+    void Track(HostObjectLifetimeTrackers::iterator position) {
+      position_ = position;
       objectTracker_.SetWeak(this, HostObjectLifetimeTracker::Destroyed, v8::WeakCallbackType::kParameter);
     }
 
-    // Useful for debugging.
     ~HostObjectLifetimeTracker() {
-      assert(isReset_);
+      assert(!secondPassPending_);
+      ResetHandle();
     }
 
     bool IsEqual(IHostProxy *hostProxy) const noexcept {
-      return hostProxy_ == hostProxy;
+      return hostProxy_.get() == hostProxy;
     }
 
+#if defined(V8JSI_ENABLE_LIFETIME_TESTS)
+    static void *operator new(size_t size) {
+      auto memory = ::operator new(size);
+      ++hostProxyLifetimeCounters.trackersAllocated;
+      return memory;
+    }
+
+    static void operator delete(void *memory) noexcept {
+      ::operator delete(memory);
+      ++hostProxyLifetimeCounters.trackersFreed;
+    }
+#endif
+
    private:
+    V8Runtime &runtime_;
+    std::unique_ptr<IHostProxy> hostProxy_;
     v8::Global<v8::Object> objectTracker_;
-    std::atomic<bool> isReset_{false};
-    IHostProxy *hostProxy_;
+    HostObjectLifetimeTrackers::iterator position_;
+    bool secondPassPending_{false};
 
     static void Destroyed(const v8::WeakCallbackInfo<HostObjectLifetimeTracker> &data) {
-      v8::HandleScope handle_scope(v8::Isolate::GetCurrent());
-      data.GetParameter()->ResetHostObject(true /*isGC*/);
+      auto tracker = data.GetParameter();
+      // V8's first pass permits only resetting the handle, not destroying
+      // captured resources that may reenter V8.
+      tracker->ResetHandle();
+      tracker->secondPassPending_ = true;
+      ++tracker->runtime_.pending_host_object_callbacks_;
+      data.SetSecondPassCallback(Finalize);
+    }
+
+    static void Finalize(const v8::WeakCallbackInfo<HostObjectLifetimeTracker> &data) {
+      auto tracker = data.GetParameter();
+      tracker->secondPassPending_ = false;
+      --tracker->runtime_.pending_host_object_callbacks_;
+      tracker->runtime_.RemoveHostObjectLifetimeTracker(tracker->position_);
     }
   };
 
@@ -413,11 +475,8 @@ class V8Runtime : public facebook::jsi::Runtime {
     }
 
    private:
-    friend class HostObjectLifetimeTracker;
     void destroy() override {
       hostObject_.reset();
-
-      // TODO: remove this from host_object_lifetime_tracker_list_ (same for HostFunctionProxy)
     }
 
     V8Runtime &runtime_;
@@ -487,9 +546,8 @@ class V8Runtime : public facebook::jsi::Runtime {
         : func_(std::move(func)), runtime_(runtime) {}
 
    private:
-    friend class HostObjectLifetimeTracker;
     void destroy() override {
-      func_ = [](Runtime &rt, const facebook::jsi::Value &thisVal, const facebook::jsi::Value *args, size_t count) {
+      func_ = [](Runtime &, const facebook::jsi::Value &, const facebook::jsi::Value *, size_t) {
         return facebook::jsi::Value::undefined();
       };
     }
@@ -709,7 +767,8 @@ class V8Runtime : public facebook::jsi::Runtime {
 #endif
 
  private:
-  void AddHostObjectLifetimeTracker(std::shared_ptr<HostObjectLifetimeTracker> hostObjectLifetimeTracker);
+  void AddHostObjectLifetimeTracker(std::unique_ptr<HostObjectLifetimeTracker> hostObjectLifetimeTracker);
+  void RemoveHostObjectLifetimeTracker(HostObjectLifetimeTrackers::iterator position);
 
   static void OnMessage(v8::Local<v8::Message> message, v8::Local<v8::Value> error);
   static size_t NearHeapLimitCallback(void *raw_state, size_t current_heap_limit, size_t initial_heap_limit);
@@ -792,7 +851,8 @@ class V8Runtime : public facebook::jsi::Runtime {
 
   v8::Persistent<v8::Function> host_object_constructor_;
 
-  std::list<std::shared_ptr<HostObjectLifetimeTracker>> host_object_lifetime_tracker_list_;
+  HostObjectLifetimeTrackers host_object_lifetime_tracker_list_;
+  size_t pending_host_object_callbacks_{0};
 
   std::string desc_;
 

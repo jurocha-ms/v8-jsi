@@ -9,6 +9,10 @@
 #include "public/ScriptStore.h"
 #include "public/V8JsiRuntime.h"
 #include "public/v8_api.h"
+#if defined(V8JSI_ENABLE_LIFETIME_TESTS)
+#include "public/V8JsiRuntimeTest.h"
+#include <jsi/instrumentation.h>
+#endif
 
 using namespace Microsoft::NodeApiJsi;
 
@@ -49,6 +53,113 @@ std::vector<facebook::jsi::RuntimeFactory> runtimeGenerators() {
 } // namespace facebook::jsi
 
 using namespace facebook::jsi;
+
+#if defined(V8JSI_ENABLE_LIFETIME_TESTS)
+namespace {
+
+v8runtime::HostProxyLifetimeStats LifetimeSnapshot() {
+  v8runtime::HostProxyLifetimeStats stats{};
+  v8runtime::v8jsi_get_host_proxy_lifetime_stats(&stats);
+  return stats;
+}
+
+void ExpectAllReclaimed(v8runtime::HostProxyLifetimeStats before) {
+  auto after = LifetimeSnapshot();
+  EXPECT_EQ(after.proxiesAllocated - before.proxiesAllocated, after.proxiesFreed - before.proxiesFreed);
+  EXPECT_EQ(after.trackersAllocated - before.trackersAllocated, after.trackersFreed - before.trackersFreed);
+}
+
+struct ReentrantCapture {
+  ReentrantCapture(Runtime &runtime, bool &destroyed) : runtime(runtime), destroyed(destroyed) {}
+  ~ReentrantCapture() {
+    runtime.global().setProperty(runtime, "captureReleased", true);
+    runtime.instrumentation().collectGarbage("reentrant capture release");
+    destroyed = true;
+  }
+  Runtime &runtime;
+  bool &destroyed;
+};
+
+void InstallReentrantFunction(Runtime &runtime, bool &destroyed) {
+  auto capture = std::make_shared<ReentrantCapture>(runtime, destroyed);
+  auto function = Function::createFromHostFunction(
+      runtime,
+      PropNameID::forAscii(runtime, "retained"),
+      0,
+      [capture](Runtime &, const Value &, const Value *, size_t) { return Value::undefined(); });
+  runtime.global().setProperty(runtime, "retained", function);
+}
+
+} // namespace
+
+TEST(HostProxyLifetime, CollectedCaptureMayReenterRuntime) {
+  auto before = LifetimeSnapshot();
+  bool destroyed = false;
+  std::unique_ptr<Runtime> runtime{v8runtime::v8jsi_create_runtime_for_lifetime_test()};
+  InstallReentrantFunction(*runtime, destroyed);
+  runtime->instrumentation().collectGarbage("retained capture");
+  EXPECT_FALSE(destroyed);
+  runtime->global().setProperty(*runtime, "retained", Value::undefined());
+  runtime->instrumentation().collectGarbage("unreachable capture");
+  EXPECT_TRUE(destroyed);
+  EXPECT_TRUE(runtime->global().getProperty(*runtime, "captureReleased").getBool());
+  ExpectAllReclaimed(before);
+}
+
+TEST(HostProxyLifetime, TeardownCaptureMayReenterRuntime) {
+  auto before = LifetimeSnapshot();
+  bool destroyed = false;
+  std::unique_ptr<Runtime> runtime{v8runtime::v8jsi_create_runtime_for_lifetime_test()};
+  InstallReentrantFunction(*runtime, destroyed);
+  runtime.reset();
+  EXPECT_TRUE(destroyed);
+  ExpectAllReclaimed(before);
+}
+
+TEST(HostProxyLifetime, TeardownKeepsReleasedFunctionShellsAlive) {
+  auto before = LifetimeSnapshot();
+  bool calledReleasedFunction = false;
+  std::unique_ptr<Runtime> runtime{v8runtime::v8jsi_create_runtime_for_lifetime_test()};
+  {
+    auto peer = Function::createFromHostFunction(
+        *runtime,
+        PropNameID::forAscii(*runtime, "peer"),
+        0,
+        [](Runtime &, const Value &, const Value *, size_t) { return Value(42); });
+    runtime->global().setProperty(*runtime, "peer", peer);
+    auto capture = std::shared_ptr<int>(new int(0), [rt = runtime.get(), &calledReleasedFunction](int *value) {
+      delete value;
+      calledReleasedFunction = rt->global().getPropertyAsFunction(*rt, "peer").call(*rt).isUndefined();
+    });
+    auto function = Function::createFromHostFunction(
+        *runtime,
+        PropNameID::forAscii(*runtime, "retained"),
+        0,
+        [capture](Runtime &, const Value &, const Value *, size_t) { return Value::undefined(); });
+    runtime->global().setProperty(*runtime, "retained", function);
+  }
+  runtime.reset();
+  EXPECT_TRUE(calledReleasedFunction);
+  ExpectAllReclaimed(before);
+}
+
+TEST(HostProxyLifetime, HostObjectsAreReclaimed) {
+  auto before = LifetimeSnapshot();
+  std::unique_ptr<Runtime> runtime{v8runtime::v8jsi_create_runtime_for_lifetime_test()};
+  auto host = std::make_shared<HostObject>();
+  std::weak_ptr<HostObject> weakHost = host;
+  {
+    auto object = Object::createFromHostObject(*runtime, host);
+    host.reset();
+    runtime->instrumentation().collectGarbage("retained host object");
+    EXPECT_FALSE(weakHost.expired());
+    EXPECT_TRUE(object.isHostObject(*runtime));
+  }
+  runtime->instrumentation().collectGarbage("unreachable host object");
+  EXPECT_TRUE(weakHost.expired());
+  ExpectAllReclaimed(before);
+}
+#endif
 
 TEST(Basic, CreateOneRuntimes) {
   v8runtime::V8RuntimeArgs args;
